@@ -1,0 +1,17 @@
+{
+    "name": "cardscope-server",
+    "version": "1.0.0",
+    "description": "CardScope backend — Claude Vision card detection + Cardmarket price lookup",
+    "type": "module",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node --watch server.js"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "dependencies": {
+        "fastify": "^5.2.0"
+    }
+}
