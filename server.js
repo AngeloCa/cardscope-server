@@ -104,9 +104,13 @@ app.post('/identify', async (request, reply) => {
                         {
                             type: 'text',
                             text: `Tu es un expert en cartes à collectionner (Pokemon, MTG, Yu-Gi-Oh, sports, etc.).
-Analyse cette image. Si une carte de collection est clairement visible, retourne UNIQUEMENT ce JSON :
+Analyse cette image. Si UNE carte de collection à l'unité (single) est clairement visible, retourne UNIQUEMENT ce JSON :
 {"detected":true,"cardName":"nom officiel anglais","game":"Pokemon|MTG|YuGiOh|Sports|other","set":"nom du set ou null","cardNumber":"numéro ou null"}
-Si aucune carte n'est clairement identifiable, retourne : {"detected":false}
+IMPORTANT : retourne {"detected":false} dans tous ces cas :
+- Booster pack, display, coffret, bundle, produit scellé (même si une carte est imprimée dessus)
+- Deck préconstruit, tin box, ETB (Elite Trainer Box)
+- Aucune carte individuelle clairement identifiable
+- Image floue ou carte pas en centre de l'image
 Ne retourne que le JSON brut, sans markdown ni explication.`,
                         },
                     ],
