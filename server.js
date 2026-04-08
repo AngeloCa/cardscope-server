@@ -132,7 +132,8 @@ app.post('/identify', async (request, reply) => {
                             type: 'text',
                             text: `Tu es un expert en cartes à collectionner (Pokemon, MTG, Yu-Gi-Oh, sports, etc.).
 Analyse cette image. Si UNE carte de collection à l'unité (single) est clairement visible, retourne UNIQUEMENT ce JSON :
-{"detected":true,"cardName":"nom officiel anglais","game":"Pokemon|MTG|YuGiOh|Sports|other","set":"nom du set ou null","cardNumber":"numéro ou null"}
+{"detected":true,"cardName":"nom officiel anglais","game":"Pokemon|MTG|YuGiOh|Sports|other","set":"nom du set ou null","cardNumber":"numéro ou null","language":"EN|JP|FR|DE|IT|ES|PT|KR|ZH"}
+Pour la langue : détecte la langue d'édition de la carte (JP=japonais, EN=anglais, FR=français, etc.) en regardant le texte imprimé, le style de la carte et le dos si visible.
 IMPORTANT : retourne {"detected":false} dans tous ces cas :
 - Booster pack, display, coffret, bundle, produit scellé (même si une carte est imprimée dessus)
 - Deck préconstruit, tin box, ETB (Elite Trainer Box)
@@ -176,6 +177,7 @@ Ne retourne que le JSON brut, sans markdown ni explication.`,
         game: parsed.game ?? 'other',
         set: parsed.set ?? null,
         cardNumber: parsed.cardNumber ?? null,
+        language: parsed.language ?? 'EN',
     });
 });
 
@@ -183,21 +185,21 @@ Ne retourne que le JSON brut, sans markdown ni explication.`,
 app.get('/price', async (request, reply) => {
     if (!checkSecret(request, reply)) return;
 
-    const { name, game = 'Pokemon', set, cardNumber, condition = 'NM' } = request.query ?? {};
-    console.log(`[price] name=${name} game=${game} set=${set} cardNumber=${cardNumber} condition=${condition}`);
+    const { name, game = 'Pokemon', set, cardNumber, condition = 'NM', language = 'EN' } = request.query ?? {};
+    console.log(`[price] name=${name} game=${game} set=${set} cardNumber=${cardNumber} condition=${condition} language=${language}`);
     if (!name) return reply.code(400).send({ error: 'Missing name param' });
 
     const justtcgKey = process.env.JUSTTCG_API_KEY;
     if (!justtcgKey) return reply.code(500).send({ error: 'JUSTTCG_API_KEY not configured' });
 
-    const cacheKey = `justtcg:${game}:${name}:${cardNumber ?? ''}:${condition}`.toLowerCase();
+    const cacheKey = `justtcg:${game}:${name}:${cardNumber ?? ''}:${condition}:${language}`.toLowerCase();
     const cached = priceCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
         console.log('[price] cache hit');
         return reply.send(cached.data);
     }
 
-    const priceData = await fetchJustTCGPrice(justtcgKey, name, game, set, cardNumber, condition);
+    const priceData = await fetchJustTCGPrice(justtcgKey, name, game, set, cardNumber, condition, language);
     console.log('[price] result:', JSON.stringify(priceData));
 
     priceCache.set(cacheKey, { data: priceData, expiresAt: Date.now() + CACHE_TTL_MS });
@@ -211,7 +213,7 @@ app.get('/', async (request, reply) => {
 
 // ─── JustTCG helpers ──────────────────────────────────────────────────────────
 
-async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition) {
+async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition, language = 'EN') {
     const gameId = JUSTTCG_GAME_MAP[game] ?? 'pokemon';
     const targetCondition = CONDITION_MAP[condition] ?? 'Near Mint';
     const justtcgUrl = `https://www.justtcg.com/search?q=${encodeURIComponent(name)}`;
@@ -220,7 +222,7 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
         // Step 1: Resolve set name → JustTCG set slug (fuzzy match, cached 24h)
         let setId = null;
         if (set && gameId) {
-            setId = await resolveSetId(apiKey, gameId, set);
+            setId = await resolveSetId(apiKey, gameId, set, language);
         }
 
         // Step 2: Search by name + set (if resolved)
@@ -231,14 +233,14 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
             headers: { 'x-api-key': apiKey, 'Accept': 'application/json' },
         });
 
-        if (!res.ok) return nullResult(condition, justtcgUrl);
+        if (!res.ok) return nullResult(condition, justtcgUrl, language);
 
         const data = await res.json();
         const cards = data?.data ?? [];
 
         // Step 3: Filter to singles only (sealed products have number = 'N/A')
         const singles = cards.filter(c => c.number && c.number !== 'N/A');
-        if (!singles.length) return nullResult(condition, justtcgUrl);
+        if (!singles.length) return nullResult(condition, justtcgUrl, language);
 
         // Step 4: Match by card number (exact) if Claude Vision provided it
         let bestMatch = null;
@@ -263,7 +265,7 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
             ?? variants.find(v => v.condition === 'Near Mint')
             ?? variants[0];
 
-        if (!targetVariant) return nullResult(condition, justtcgUrl);
+        if (!targetVariant) return nullResult(condition, justtcgUrl, language);
 
         // Step 6: Convert USD cents → EUR
         const currentPriceUSD = (targetVariant.price ?? 0) / 100;
@@ -279,11 +281,12 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
             cardName: bestMatch.name,
             setName: bestMatch.set_name,
             cardNumber: bestMatch.number,
+            language,
             justtcgUrl,
             source: 'justtcg',
         };
     } catch {
-        return nullResult(condition, justtcgUrl);
+        return nullResult(condition, justtcgUrl, language);
     }
 }
 
@@ -291,7 +294,7 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
  * Resolves a human-readable set name (from Claude Vision) to a JustTCG set slug.
  * Fetches all sets for the game once per 24h and does fuzzy string matching.
  */
-async function resolveSetId(apiKey, gameId, setName) {
+async function resolveSetId(apiKey, gameId, setName, language = 'EN') {
     // Check cache
     const cacheEntry = setsCache.get(gameId);
     let sets;
@@ -312,9 +315,21 @@ async function resolveSetId(apiKey, gameId, setName) {
         }
     }
 
+    // Language-aware filtering: JP cards → prefer japanese sets, others → exclude japanese sets
+    const isJapanese = language === 'JP';
+    const filteredSets = sets.filter(s => {
+        const nameLC = (s.name ?? '').toLowerCase();
+        const idLC = (s.id ?? '').toLowerCase();
+        const isJpSet = nameLC.includes('japanese') || idLC.includes('japanese') || nameLC.includes('japan');
+        return isJapanese ? isJpSet : !isJpSet;
+    });
+
+    // Use filtered list; fall back to all sets if no match in filtered
+    const candidateSets = filteredSets.length > 0 ? filteredSets : sets;
+
     // Fuzzy match: normalize both strings and find best overlap
     const normalizedInput = normStr(setName);
-    const scored = sets.map(s => ({
+    const scored = candidateSets.map(s => ({
         id: s.id,
         score: overlapScore(normStr(s.name), normalizedInput),
     }));
@@ -339,12 +354,13 @@ function overlapScore(a, b) {
     return count;
 }
 
-function nullResult(condition, justtcgUrl) {
+function nullResult(condition, justtcgUrl, language = 'EN') {
     return {
         trendPrice: null,
         lowPrice: null,
         condition,
         currency: 'EUR',
+        language,
         justtcgUrl,
         source: 'justtcg',
     };
