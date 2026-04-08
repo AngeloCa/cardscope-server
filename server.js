@@ -44,6 +44,10 @@ const USD_TO_EUR = 0.92;
 // In-memory price cache: key → { data, expiresAt }
 const priceCache = new Map();
 
+// Set catalog cache per game: gameId → { sets: [{id, name}], expiresAt }
+const setsCache = new Map();
+const SETS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+
 const app = Fastify({ logger: false });
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -147,7 +151,7 @@ app.get('/price', async (request, reply) => {
     const justtcgKey = process.env.JUSTTCG_API_KEY;
     if (!justtcgKey) return reply.code(500).send({ error: 'JUSTTCG_API_KEY not configured' });
 
-    const cacheKey = `justtcg:${game}:${name}:${condition}`.toLowerCase();
+    const cacheKey = `justtcg:${game}:${name}:${cardNumber ?? ''}:${condition}`.toLowerCase();
     const cached = priceCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
         return reply.send(cached.data);
@@ -171,59 +175,60 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
     const targetCondition = CONDITION_MAP[condition] ?? 'Near Mint';
     const justtcgUrl = `https://www.justtcg.com/search?q=${encodeURIComponent(name)}`;
 
-    // Build search query — include card number if available for precision
-    const searchName = cardNumber ? `${name} ${cardNumber}` : name;
-
-    const params = new URLSearchParams({
-        name: searchName,
-        game: gameId,
-        limit: '20',
-    });
-    if (set) params.set('set', set);
-
     try {
+        // Step 1: Resolve set name → JustTCG set slug (fuzzy match, cached 24h)
+        let setId = null;
+        if (set && gameId) {
+            setId = await resolveSetId(apiKey, gameId, set);
+        }
+
+        // Step 2: Search by name + set (if resolved)
+        const params = new URLSearchParams({ name, game: gameId, limit: '20' });
+        if (setId) params.set('set', setId);
+
         const res = await fetch(`${JUSTTCG_API_URL}/cards?${params}`, {
-            headers: {
-                'x-api-key': apiKey,
-                'Accept': 'application/json',
-            },
+            headers: { 'x-api-key': apiKey, 'Accept': 'application/json' },
         });
 
-        if (!res.ok) {
-            return nullResult(condition, justtcgUrl);
-        }
+        if (!res.ok) return nullResult(condition, justtcgUrl);
 
         const data = await res.json();
         const cards = data?.data ?? [];
 
-        // Filter to single cards only (exclude sealed products which have number='N/A')
+        // Step 3: Filter to singles only (sealed products have number = 'N/A')
         const singles = cards.filter(c => c.number && c.number !== 'N/A');
+        if (!singles.length) return nullResult(condition, justtcgUrl);
 
-        if (!singles.length) {
-            return nullResult(condition, justtcgUrl);
+        // Step 4: Match by card number (exact) if Claude Vision provided it
+        let bestMatch = null;
+        if (cardNumber) {
+            // Normalize: "006/165" vs "6/165" — strip leading zeros in first part
+            const normalizeNumber = n => n.replace(/^0+(\d)/, '$1');
+            const targetNum = normalizeNumber(cardNumber);
+            bestMatch = singles.find(c => normalizeNumber(c.number) === targetNum);
         }
 
-        // Pick best match: first single with a matching name (case-insensitive)
-        const normalizedSearch = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-        const bestMatch = singles.find(c =>
-            c.name.toLowerCase().replace(/[^a-z0-9\s]/g, '').includes(normalizedSearch)
-        ) ?? singles[0];
+        // Fallback: best name match
+        if (!bestMatch) {
+            const normalizedSearch = normStr(name);
+            bestMatch = singles.find(c => normStr(c.name).includes(normalizedSearch))
+                ?? singles.find(c => normalizedSearch.includes(normStr(c.name)))
+                ?? singles[0];
+        }
 
-        // Find variant matching the requested condition
+        // Step 5: Find variant for requested condition
         const variants = bestMatch.variants ?? [];
         const targetVariant = variants.find(v => v.condition === targetCondition)
             ?? variants.find(v => v.condition === 'Near Mint')
             ?? variants[0];
 
-        if (!targetVariant) {
-            return nullResult(condition, justtcgUrl);
-        }
+        if (!targetVariant) return nullResult(condition, justtcgUrl);
 
-        // JustTCG prices are in USD cents → convert to EUR
-        const priceUSD = (targetVariant.price ?? 0) / 100;
-        const avg30dUSD = (targetVariant.avgPrice30d ?? targetVariant.avgPrice ?? 0) / 100;
+        // Step 6: Convert USD cents → EUR
+        const currentPriceUSD = (targetVariant.price ?? 0) / 100;
+        const avg30dUSD = (targetVariant.avgPrice30d ?? targetVariant.avgPrice ?? targetVariant.price ?? 0) / 100;
         const trendPrice = round2(avg30dUSD * USD_TO_EUR);
-        const lowPrice = round2(priceUSD * USD_TO_EUR);
+        const lowPrice = round2(currentPriceUSD * USD_TO_EUR);
 
         return {
             trendPrice: trendPrice > 0 ? trendPrice : null,
@@ -239,6 +244,58 @@ async function fetchJustTCGPrice(apiKey, name, game, set, cardNumber, condition)
     } catch {
         return nullResult(condition, justtcgUrl);
     }
+}
+
+/**
+ * Resolves a human-readable set name (from Claude Vision) to a JustTCG set slug.
+ * Fetches all sets for the game once per 24h and does fuzzy string matching.
+ */
+async function resolveSetId(apiKey, gameId, setName) {
+    // Check cache
+    const cacheEntry = setsCache.get(gameId);
+    let sets;
+    if (cacheEntry && cacheEntry.expiresAt > Date.now()) {
+        sets = cacheEntry.sets;
+    } else {
+        // Fetch all sets for this game (paginate up to 200)
+        try {
+            const res = await fetch(`${JUSTTCG_API_URL}/sets?game=${gameId}&limit=200`, {
+                headers: { 'x-api-key': apiKey, 'Accept': 'application/json' },
+            });
+            if (!res.ok) return null;
+            const data = await res.json();
+            sets = data?.data ?? [];
+            setsCache.set(gameId, { sets, expiresAt: Date.now() + SETS_CACHE_TTL_MS });
+        } catch {
+            return null;
+        }
+    }
+
+    // Fuzzy match: normalize both strings and find best overlap
+    const normalizedInput = normStr(setName);
+    const scored = sets.map(s => ({
+        id: s.id,
+        score: overlapScore(normStr(s.name), normalizedInput),
+    }));
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0];
+    return best && best.score > 0 ? best.id : null;
+}
+
+/** Normalize string: lowercase, remove special chars, keep digits */
+function normStr(s) {
+    return (s ?? '').toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/** Overlap score: count shared words between two normalized strings */
+function overlapScore(a, b) {
+    const wordsA = new Set(a.split(' '));
+    const wordsB = new Set(b.split(' '));
+    let count = 0;
+    for (const w of wordsA) {
+        if (w.length > 1 && wordsB.has(w)) count++;
+    }
+    return count;
 }
 
 function nullResult(condition, justtcgUrl) {
