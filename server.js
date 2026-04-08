@@ -101,14 +101,14 @@ function checkSecret(request, reply) {
 
 // ─── Claude Vision: shared identify helper ────────────────────────────────────
 const CLAUDE_PROMPT = `Tu es un expert en cartes à collectionner (Pokemon, MTG, Yu-Gi-Oh, sports, etc.).
-Analyse cette image. Si UNE carte de collection à l'unité (single) est clairement visible, retourne UNIQUEMENT ce JSON :
+Analyse cette image. Si une carte de collection à l'unité (single) est visible — même tenue à la main, sur le côté, ou partiellement visible — retourne UNIQUEMENT ce JSON :
 {"detected":true,"cardName":"nom officiel anglais","game":"Pokemon|MTG|YuGiOh|Sports|other","set":"nom du set ou null","cardNumber":"numéro ou null","language":"EN|JP|FR|DE|IT|ES|PT|KR|ZH"}
-Pour la langue : détecte la langue d'édition de la carte (JP=japonais, EN=anglais, FR=français, etc.) en regardant le texte imprimé, le style de la carte et le dos si visible.
-IMPORTANT : retourne {"detected":false} dans tous ces cas :
-- Booster pack, display, coffret, bundle, produit scellé (même si une carte est imprimée dessus)
+Pour la langue : détecte la langue d'édition de la carte (JP=japonais, EN=anglais, FR=français, etc.).
+Pour le set et le numéro : lis attentivement le bas de la carte où ils sont imprimés.
+Retourne {"detected":false} UNIQUEMENT si :
+- Booster pack, display, coffret, bundle ou produit scellé
 - Deck préconstruit, tin box, ETB (Elite Trainer Box)
-- Aucune carte individuelle clairement identifiable
-- Image floue ou carte pas en centre de l'image
+- Aucun élément de carte lisible (trop flou, trop petit, hors cadre)
 Ne retourne que le JSON brut, sans markdown ni explication.`;
 
 async function identifyFromBase64(apiKey, base64, mediaType = 'image/jpeg') {
@@ -204,8 +204,8 @@ app.post('/telegram', async (request, reply) => {
 
     await tgAction(token, chatId, 'typing');
 
-    // Pick a medium-sized photo (index -2 or best available) to limit Claude payload
-    const chosen = photo.length >= 2 ? photo[photo.length - 2] : photo[photo.length - 1];
+    // Use largest available photo for best OCR accuracy
+    const chosen = photo[photo.length - 1];
 
     // Download from Telegram
     let base64;
@@ -233,7 +233,11 @@ app.post('/telegram', async (request, reply) => {
 
     if (!identified.detected) {
         await tgSend(token, chatId,
-            '🔍 Aucune carte TCG détectée.\n\nAssure-toi que la carte est bien visible et au centre de la photo.'
+            '🔍 Carte non identifiée.\n\n' +
+            'Conseils pour un meilleur résultat :\n' +
+            '• Envoie un screenshot zoomé sur la carte\n' +
+            '• Le nom et le numéro en bas de la carte doivent être lisibles\n' +
+            '• Évite le mouvement (freeze frame si possible)'
         );
         return;
     }
