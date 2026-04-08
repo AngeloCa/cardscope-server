@@ -99,6 +99,67 @@ function checkSecret(request, reply) {
     return true;
 }
 
+// ─── Claude Vision: shared identify helper ────────────────────────────────────
+const CLAUDE_PROMPT = `Tu es un expert en cartes à collectionner (Pokemon, MTG, Yu-Gi-Oh, sports, etc.).
+Analyse cette image. Si UNE carte de collection à l'unité (single) est clairement visible, retourne UNIQUEMENT ce JSON :
+{"detected":true,"cardName":"nom officiel anglais","game":"Pokemon|MTG|YuGiOh|Sports|other","set":"nom du set ou null","cardNumber":"numéro ou null","language":"EN|JP|FR|DE|IT|ES|PT|KR|ZH"}
+Pour la langue : détecte la langue d'édition de la carte (JP=japonais, EN=anglais, FR=français, etc.) en regardant le texte imprimé, le style de la carte et le dos si visible.
+IMPORTANT : retourne {"detected":false} dans tous ces cas :
+- Booster pack, display, coffret, bundle, produit scellé (même si une carte est imprimée dessus)
+- Deck préconstruit, tin box, ETB (Elite Trainer Box)
+- Aucune carte individuelle clairement identifiable
+- Image floue ou carte pas en centre de l'image
+Ne retourne que le JSON brut, sans markdown ni explication.`;
+
+async function identifyFromBase64(apiKey, base64, mediaType = 'image/jpeg') {
+    const claudeResponse = await enqueueAnthropicCall(() => fetch(ANTHROPIC_API_URL, {
+        method: 'POST',
+        headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: ANTHROPIC_MODEL,
+            max_tokens: 256,
+            messages: [{
+                role: 'user',
+                content: [
+                    { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+                    { type: 'text', text: CLAUDE_PROMPT },
+                ],
+            }],
+        }),
+    }));
+
+    if (!claudeResponse.ok) {
+        const err = await claudeResponse.text().catch(() => '');
+        console.log(`[identify] Claude HTTP ${claudeResponse.status}:`, err);
+        throw new Error(`Claude API error ${claudeResponse.status}`);
+    }
+
+    const data = await claudeResponse.json();
+    const text = data?.content?.[0]?.text ?? '';
+    console.log('[identify] Claude raw:', text);
+
+    let parsed;
+    try {
+        parsed = JSON.parse(text.replace(/```[a-z]*\n?/gi, '').trim());
+    } catch {
+        return { detected: false };
+    }
+
+    if (!parsed.detected) return { detected: false };
+    return {
+        detected: true,
+        cardName: parsed.cardName ?? null,
+        game: parsed.game ?? 'other',
+        set: parsed.set ?? null,
+        cardNumber: parsed.cardNumber ?? null,
+        language: parsed.language ?? 'EN',
+    };
+}
+
 // ─── POST /identify ───────────────────────────────────────────────────────────
 app.post('/identify', async (request, reply) => {
     if (!checkSecret(request, reply)) return;
@@ -109,77 +170,120 @@ app.post('/identify', async (request, reply) => {
     const { image } = request.body ?? {};
     if (!image) return reply.code(400).send({ error: 'Missing image field' });
 
-    let claudeResponse;
     try {
-        claudeResponse = await enqueueAnthropicCall(() => fetch(ANTHROPIC_API_URL, {
-            method: 'POST',
-            headers: {
-                'x-api-key': apiKey,
-                'anthropic-version': '2023-06-01',
-                'content-type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: ANTHROPIC_MODEL,
-                max_tokens: 256,
-                messages: [{
-                    role: 'user',
-                    content: [
-                        {
-                            type: 'image',
-                            source: { type: 'base64', media_type: 'image/jpeg', data: image },
-                        },
-                        {
-                            type: 'text',
-                            text: `Tu es un expert en cartes à collectionner (Pokemon, MTG, Yu-Gi-Oh, sports, etc.).
-Analyse cette image. Si UNE carte de collection à l'unité (single) est clairement visible, retourne UNIQUEMENT ce JSON :
-{"detected":true,"cardName":"nom officiel anglais","game":"Pokemon|MTG|YuGiOh|Sports|other","set":"nom du set ou null","cardNumber":"numéro ou null","language":"EN|JP|FR|DE|IT|ES|PT|KR|ZH"}
-Pour la langue : détecte la langue d'édition de la carte (JP=japonais, EN=anglais, FR=français, etc.) en regardant le texte imprimé, le style de la carte et le dos si visible.
-IMPORTANT : retourne {"detected":false} dans tous ces cas :
-- Booster pack, display, coffret, bundle, produit scellé (même si une carte est imprimée dessus)
-- Deck préconstruit, tin box, ETB (Elite Trainer Box)
-- Aucune carte individuelle clairement identifiable
-- Image floue ou carte pas en centre de l'image
-Ne retourne que le JSON brut, sans markdown ni explication.`,
-                        },
-                    ],
-                }],
-            }),
-        }));
+        const result = await identifyFromBase64(apiKey, image);
+        return reply.send(result);
     } catch (e) {
-        return reply.code(502).send({ error: `Claude fetch error: ${e.message}` });
+        return reply.code(502).send({ error: e.message });
     }
-
-    const response = claudeResponse;
-    if (!response.ok) {
-        const err = await response.text().catch(() => '');
-        console.log(`[identify] Claude HTTP ${response.status}:`, err);
-        return reply.code(502).send({ error: `Claude API error: ${err.slice(0, 200)}` });
-    }
-
-    const data = await response.json();
-    const text = data?.content?.[0]?.text ?? '';
-    console.log('[identify] Claude raw:', text);
-
-    let parsed;
-    try {
-        parsed = JSON.parse(text.replace(/```[a-z]*\n?/gi, '').trim());
-    } catch {
-        console.log('[identify] JSON parse failed');
-        return reply.send({ detected: false });
-    }
-
-    console.log('[identify] parsed:', JSON.stringify(parsed));
-    if (!parsed.detected) return reply.send({ detected: false });
-
-    return reply.send({
-        detected: true,
-        cardName: parsed.cardName ?? null,
-        game: parsed.game ?? 'other',
-        set: parsed.set ?? null,
-        cardNumber: parsed.cardNumber ?? null,
-        language: parsed.language ?? 'EN',
-    });
 });
+
+// ─── POST /telegram (webhook) ─────────────────────────────────────────────────
+app.post('/telegram', async (request, reply) => {
+    // Respond immediately — Telegram requires fast ACK
+    reply.code(200).send('ok');
+
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    const justtcgKey = process.env.JUSTTCG_API_KEY;
+    if (!token) return;
+
+    const message = request.body?.message;
+    if (!message) return;
+
+    const chatId = message.chat.id;
+    const photo = message.photo;
+
+    if (!photo) {
+        await tgSend(token, chatId,
+            '📸 Envoie-moi une photo d\'une carte TCG et je te donne sa cote !\n\n' +
+            'Tu peux aussi envoyer une photo depuis un live Voggt, Whatnot, Twitch…'
+        );
+        return;
+    }
+
+    await tgAction(token, chatId, 'typing');
+
+    // Pick a medium-sized photo (index -2 or best available) to limit Claude payload
+    const chosen = photo.length >= 2 ? photo[photo.length - 2] : photo[photo.length - 1];
+
+    // Download from Telegram
+    let base64;
+    try {
+        const fileRes = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${chosen.file_id}`);
+        const fileData = await fileRes.json();
+        const filePath = fileData.result?.file_path;
+        if (!filePath) throw new Error('No file path');
+        const imgRes = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+        const buf = await imgRes.arrayBuffer();
+        base64 = Buffer.from(buf).toString('base64');
+    } catch (e) {
+        await tgSend(token, chatId, '❌ Impossible de télécharger la photo.');
+        return;
+    }
+
+    // Identify card
+    let identified;
+    try {
+        identified = await identifyFromBase64(apiKey, base64, 'image/jpeg');
+    } catch {
+        await tgSend(token, chatId, '❌ Erreur lors de l\'analyse (serveur IA indisponible).');
+        return;
+    }
+
+    if (!identified.detected) {
+        await tgSend(token, chatId,
+            '🔍 Aucune carte TCG détectée.\n\nAssure-toi que la carte est bien visible et au centre de la photo.'
+        );
+        return;
+    }
+
+    const { cardName, game, set, cardNumber, language } = identified;
+
+    // Fetch price
+    const priceData = await fetchJustTCGPrice(justtcgKey, cardName, game, set, cardNumber, 'NM', language ?? 'EN');
+
+    // Build reply
+    const langStr = language && language !== 'EN' ? ` 🌐 ${language}` : '';
+    const meta = [set, cardNumber ? `#${cardNumber}` : null].filter(Boolean).join(' • ');
+    const psaUrl = `https://www.ebay.fr/sch/i.html?_nkw=${encodeURIComponent('PSA 10 ' + cardName)}&LH_Complete=1&LH_Sold=1&_sop=13`;
+
+    let text = `🃏 *${escTg(cardName)}*${langStr}\n`;
+    if (meta) text += `📦 ${escTg(meta)}\n`;
+    text += '\n';
+
+    if (priceData.trendPrice != null) {
+        text += `💰 Tendance: *${priceData.trendPrice.toFixed(2)} €*\n`;
+        text += `📉 Prix bas: ${priceData.lowPrice?.toFixed(2) ?? '—'} €\n`;
+    } else {
+        text += `❓ Prix non disponible sur JustTCG\n`;
+    }
+
+    text += `\n[📊 Prix PSA 10 sur eBay](${psaUrl})`;
+    if (priceData.justtcgUrl) text += ` | [🔗 JustTCG](${priceData.justtcgUrl})`;
+
+    await tgSend(token, chatId, text, 'Markdown');
+});
+
+function escTg(str) {
+    return String(str ?? '').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+}
+
+async function tgSend(token, chatId, text, parseMode) {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text, parse_mode: parseMode, disable_web_page_preview: true }),
+    }).catch(() => {});
+}
+
+async function tgAction(token, chatId, action) {
+    await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, action }),
+    }).catch(() => {});
+}
 
 // ─── GET /price ───────────────────────────────────────────────────────────────
 app.get('/price', async (request, reply) => {
@@ -373,4 +477,17 @@ function round2(n) {
 // ─── Start ────────────────────────────────────────────────────────────────────
 const port = parseInt(process.env.PORT ?? '3000', 10);
 await app.listen({ port, host: '0.0.0.0' });
+
+// Register Telegram webhook after server is up
+const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+const publicUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : null;
+
+if (tgToken && publicUrl) {
+    const webhookUrl = `${publicUrl}/telegram`;
+    const res = await fetch(`https://api.telegram.org/bot${tgToken}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
+    const data = await res.json();
+    console.log('[telegram] webhook set:', webhookUrl, '→', data.description ?? data.ok);
+}
 console.log(`CardScope Server running on http://0.0.0.0:${port}`);
