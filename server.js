@@ -48,7 +48,7 @@ const priceCache = new Map();
 const setsCache = new Map();
 const SETS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
-const app = Fastify({ logger: false });
+const app = Fastify({ logger: true });
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 app.addHook('onRequest', (request, reply, done) => {
@@ -126,14 +126,17 @@ Ne retourne que le JSON brut, sans markdown ni explication.`,
 
     const data = await response.json();
     const text = data?.content?.[0]?.text ?? '';
+    console.log('[identify] Claude raw:', text);
 
     let parsed;
     try {
         parsed = JSON.parse(text.replace(/```[a-z]*\n?/gi, '').trim());
     } catch {
+        console.log('[identify] JSON parse failed');
         return reply.send({ detected: false });
     }
 
+    console.log('[identify] parsed:', JSON.stringify(parsed));
     if (!parsed.detected) return reply.send({ detected: false });
 
     return reply.send({
@@ -150,6 +153,7 @@ app.get('/price', async (request, reply) => {
     if (!checkSecret(request, reply)) return;
 
     const { name, game = 'Pokemon', set, cardNumber, condition = 'NM' } = request.query ?? {};
+    console.log(`[price] name=${name} game=${game} set=${set} cardNumber=${cardNumber} condition=${condition}`);
     if (!name) return reply.code(400).send({ error: 'Missing name param' });
 
     const justtcgKey = process.env.JUSTTCG_API_KEY;
@@ -158,10 +162,12 @@ app.get('/price', async (request, reply) => {
     const cacheKey = `justtcg:${game}:${name}:${cardNumber ?? ''}:${condition}`.toLowerCase();
     const cached = priceCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
+        console.log('[price] cache hit');
         return reply.send(cached.data);
     }
 
     const priceData = await fetchJustTCGPrice(justtcgKey, name, game, set, cardNumber, condition);
+    console.log('[price] result:', JSON.stringify(priceData));
 
     priceCache.set(cacheKey, { data: priceData, expiresAt: Date.now() + CACHE_TTL_MS });
     return reply.send(priceData);
