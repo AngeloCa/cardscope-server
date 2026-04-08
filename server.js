@@ -121,7 +121,8 @@ Ne retourne que le JSON brut, sans markdown ni explication.`,
 
     if (!response.ok) {
         const err = await response.text().catch(() => '');
-        return reply.code(502).send({ error: `Claude API error: ${err.slice(0, 120)}` });
+        console.log(`[identify] Claude HTTP ${response.status}:`, err);
+        return reply.code(502).send({ error: `Claude API error: ${err.slice(0, 200)}` });
     }
 
     const data = await response.json();
