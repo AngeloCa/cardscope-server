@@ -50,6 +50,32 @@ const SETS_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 const app = Fastify({ logger: true });
 
+// ─── Anthropic request queue ───────────────────────────────────────────────────
+// Serialises calls to Claude to avoid 429 rate-limit bursts.
+// Max 1 concurrent request; extras wait in line (FIFO).
+let anthropicBusy = false;
+const anthropicQueue = [];
+
+function enqueueAnthropicCall(fn) {
+    return new Promise((resolve, reject) => {
+        anthropicQueue.push({ fn, resolve, reject });
+        drainAnthropicQueue();
+    });
+}
+
+function drainAnthropicQueue() {
+    if (anthropicBusy || anthropicQueue.length === 0) return;
+    anthropicBusy = true;
+    const { fn, resolve, reject } = anthropicQueue.shift();
+    fn()
+        .then(resolve)
+        .catch(reject)
+        .finally(() => {
+            anthropicBusy = false;
+            drainAnthropicQueue();
+        });
+}
+
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 app.addHook('onRequest', (request, reply, done) => {
     reply.header('Access-Control-Allow-Origin', '*');
@@ -83,18 +109,19 @@ app.post('/identify', async (request, reply) => {
     const { image } = request.body ?? {};
     if (!image) return reply.code(400).send({ error: 'Missing image field' });
 
-    const response = await fetch(ANTHROPIC_API_URL, {
-        method: 'POST',
-        headers: {
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-            model: ANTHROPIC_MODEL,
-            max_tokens: 256,
-            messages: [
-                {
+    let claudeResponse;
+    try {
+        claudeResponse = await enqueueAnthropicCall(() => fetch(ANTHROPIC_API_URL, {
+            method: 'POST',
+            headers: {
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: ANTHROPIC_MODEL,
+                max_tokens: 256,
+                messages: [{
                     role: 'user',
                     content: [
                         {
@@ -114,11 +141,14 @@ IMPORTANT : retourne {"detected":false} dans tous ces cas :
 Ne retourne que le JSON brut, sans markdown ni explication.`,
                         },
                     ],
-                },
-            ],
-        }),
-    });
+                }],
+            }),
+        }));
+    } catch (e) {
+        return reply.code(502).send({ error: `Claude fetch error: ${e.message}` });
+    }
 
+    const response = claudeResponse;
     if (!response.ok) {
         const err = await response.text().catch(() => '');
         console.log(`[identify] Claude HTTP ${response.status}:`, err);
